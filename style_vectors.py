@@ -453,19 +453,4 @@ with gr.Blocks(theme="NoCrypt/miku") as app:
                 outputs=[info2],
             )
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--server-name",
-    type=str,
-    default=None,
-    help="Server name for Gradio app",
-)
-parser.add_argument(
-    "--no-autolaunch",
-    action="store_true",
-    default=False,
-    help="Do not launch app automatically",
-)
-args = parser.parse_args()
 
-app.launch(inbrowser=not args.no_autolaunch, server_name=args.server_name)

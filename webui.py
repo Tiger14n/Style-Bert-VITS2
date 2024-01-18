@@ -1,557 +1,857 @@
-"""
-Original `webui.py` for Bert-VITS2, not working with Style-Bert-VITS2 yet.
-"""
-# flake8: noqa: E402
-import os
-import logging
-import re_matching
-from tools.sentence import split_by_language
 
-logging.getLogger("numba").setLevel(logging.WARNING)
-logging.getLogger("markdown_it").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("matplotlib").setLevel(logging.WARNING)
-
-logging.basicConfig(
-    level=logging.INFO, format="| %(name)s | %(levelname)s | %(message)s"
+from typing import Optional
+from common.constants import (
+    DEFAULT_ASSIST_TEXT_WEIGHT,
+    DEFAULT_LENGTH,
+    DEFAULT_LINE_SPLIT,
+    DEFAULT_NOISE,
+    DEFAULT_NOISEW,
+    DEFAULT_SDP_RATIO,
+    DEFAULT_SPLIT_INTERVAL,
+    DEFAULT_STYLE,
+    DEFAULT_STYLE_WEIGHT,
+    Languages,
 )
-
-logger = logging.getLogger(__name__)
-
-import torch
-import utils
-from infer import infer, latest_version, get_net_g, infer_multilang
+import torch, json, os, argparse, datetime, sys, yaml
+from common.tts_model import ModelHolder
 import gradio as gr
-import webbrowser
-import numpy as np
+from multiprocessing import cpu_count
+from common.log import logger
+from common.subprocess_utils import run_script_with_log
+from train import ( preprocess_all, initialize, resample, preprocess_text, bert_gen, style_gen, train )
+from common.subprocess_utils import run_script_with_log, second_elem_of
+from scipy.spatial.distance import pdist, squareform
+from sklearn.cluster import DBSCAN, AgglomerativeClustering, KMeans
+from sklearn.manifold import TSNE
+from umap import UMAP
+from common.constants import DEFAULT_STYLE
 from config import config
-from tools.translate import translate
-import librosa
+from style_vectors import ( load, save_style_vectors_from_clustering, save_style_vectors_from_files, representative_wav_files_gradio, do_clustering_gradio, do_dbscan_gradio )
+from app import gr_util, make_non_interactive
+from infer import InvalidToneError
+from text.japanese import g2kata_tone, kata_tone2phone_tone, text_normalize
+# Get path settings
+with open(os.path.join("configs", "paths.yml"), "r", encoding="utf-8") as f:
+    path_config: dict[str, str] = yaml.safe_load(f.read())
+    dataset_root = path_config["dataset_root"]
+    # assets_root = path_config["assets_root"]
 
-net_g = None
 
-device = config.webui_config.device
-if device == "mps":
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
-
-def generate_audio(
-    slices,
-    sdp_ratio,
-    noise_scale,
-    noise_scale_w,
-    length_scale,
-    speaker,
-    language,
-    reference_audio,
-    emotion,
-    style_text,
-    style_weight,
-    skip_start=False,
-    skip_end=False,
+def do_slice(
+    model_name: str,
+    min_sec: float,
+    max_sec: float,
+    min_silence_dur_ms: int,
+    input_dir: str,
 ):
-    audio_list = []
-    # silence = np.zeros(hps.data.sampling_rate // 2, dtype=np.int16)
-    with torch.no_grad():
-        for idx, piece in enumerate(slices):
-            skip_start = idx != 0
-            skip_end = idx != len(slices) - 1
-            audio = infer(
-                piece,
-                reference_audio=reference_audio,
-                emotion=emotion,
-                sdp_ratio=sdp_ratio,
-                noise_scale=noise_scale,
-                noise_scale_w=noise_scale_w,
-                length_scale=length_scale,
-                sid=speaker,
-                language=language,
-                hps=hps,
-                net_g=net_g,
-                device=device,
-                skip_start=skip_start,
-                skip_end=skip_end,
-                assist_text=style_text,
-                assist_text_weight=style_weight,
-            )
-            audio16bit = gr.processing_utils.convert_to_16_bit_wav(audio)
-            audio_list.append(audio16bit)
-    return audio_list
+    if model_name == "":
+        return "Error: Enter model name."
+    logger.info("Start slicing...")
+    output_dir = os.path.join(dataset_root, model_name, "raw")
+    cmd = [
+        "slice.py",
+        "--output_dir",
+        output_dir,
+        "--min_sec",
+        str(min_sec),
+        "--max_sec",
+        str(max_sec),
+        "--min_silence_dur_ms",
+        str(min_silence_dur_ms),
+    ]
+    if input_dir != "":
+        cmd += ["--input_dir", input_dir]
+    # ignore ONNX warning
+    success, message = run_script_with_log(cmd, ignore_warning=True)
+    if not success:
+        return f"Error: {message}"
+    return "Audio slicing has been completed."
 
 
-def generate_audio_multilang(
-    slices,
-    sdp_ratio,
-    noise_scale,
-    noise_scale_w,
-    length_scale,
-    speaker,
-    language,
-    reference_audio,
-    emotion,
-    skip_start=False,
-    skip_end=False,
+def do_transcribe(
+    model_name, 
+    whisper_model,
+    compute_type, 
+    language, 
+    #initial_prompt,
+    input_dir, 
+    device
 ):
-    audio_list = []
-    # silence = np.zeros(hps.data.sampling_rate // 2, dtype=np.int16)
-    with torch.no_grad():
-        for idx, piece in enumerate(slices):
-            skip_start = idx != 0
-            skip_end = idx != len(slices) - 1
-            audio = infer_multilang(
-                piece,
-                reference_audio=reference_audio,
-                emotion=emotion,
-                sdp_ratio=sdp_ratio,
-                noise_scale=noise_scale,
-                noise_scale_w=noise_scale_w,
-                length_scale=length_scale,
-                sid=speaker,
-                language=language[idx],
-                hps=hps,
-                net_g=net_g,
-                device=device,
-                skip_start=skip_start,
-                skip_end=skip_end,
-            )
-            audio16bit = gr.processing_utils.convert_to_16_bit_wav(audio)
-            audio_list.append(audio16bit)
-    return audio_list
+    if model_name == "":
+        return "Error: Enter model name."
+    initial_prompt = ""
+    if input_dir == "":
+        input_dir = os.path.join(dataset_root, model_name, "raw")
+    output_file = os.path.join(dataset_root, model_name, "esd.list")
+    success, message = run_script_with_log(
+        [
+            "transcribe.py",
+            "--input_dir",
+            input_dir,
+            "--output_file",
+            output_file,
+            "--speaker_name",
+            model_name,
+            "--model",
+            whisper_model,
+            "--compute_type",
+            compute_type,
+            "--device",
+            device,
+            "--language",
+            language,
+            "--initial_prompt",
+            f'"{initial_prompt}"',
+        ]
+    )
+    if not success:
+        return f"Error: {message}"
+    return """Audio transcription has been completed.
 
-
-def tts_split(
-    text: str,
-    speaker,
-    sdp_ratio,
-    noise_scale,
-    noise_scale_w,
-    length_scale,
-    language,
-    cut_by_sent,
-    interval_between_para,
-    interval_between_sent,
-    reference_audio,
-    emotion,
-    style_text,
-    style_weight,
-):
-    while text.find("\n\n") != -1:
-        text = text.replace("\n\n", "\n")
-    text = text.replace("|", "")
-    para_list = re_matching.cut_para(text)
-    para_list = [p for p in para_list if p != ""]
-    audio_list = []
-    for p in para_list:
-        if not cut_by_sent:
-            audio_list += process_text(
-                p,
-                speaker,
-                sdp_ratio,
-                noise_scale,
-                noise_scale_w,
-                length_scale,
-                language,
-                reference_audio,
-                emotion,
-                style_text,
-                style_weight,
-            )
-            silence = np.zeros((int)(44100 * interval_between_para), dtype=np.int16)
-            audio_list.append(silence)
-        else:
-            audio_list_sent = []
-            sent_list = re_matching.cut_sent(p)
-            sent_list = [s for s in sent_list if s != ""]
-            for s in sent_list:
-                audio_list_sent += process_text(
-                    s,
-                    speaker,
-                    sdp_ratio,
-                    noise_scale,
-                    noise_scale_w,
-                    length_scale,
-                    language,
-                    reference_audio,
-                    emotion,
-                    style_text,
-                    style_weight,
-                )
-                silence = np.zeros((int)(44100 * interval_between_sent))
-                audio_list_sent.append(silence)
-            if (interval_between_para - interval_between_sent) > 0:
-                silence = np.zeros(
-                    (int)(44100 * (interval_between_para - interval_between_sent))
-                )
-                audio_list_sent.append(silence)
-            audio16bit = gr.processing_utils.convert_to_16_bit_wav(
-                np.concatenate(audio_list_sent)
-            )  # 对完整句子做音量归一
-            audio_list.append(audio16bit)
-    audio_concat = np.concatenate(audio_list)
-    return ("Success", (hps.data.sampling_rate, audio_concat))
-
-
-def process_mix(slice):
-    _speaker = slice.pop()
-    _text, _lang = [], []
-    for lang, content in slice:
-        content = content.split("|")
-        content = [part for part in content if part != ""]
-        if len(content) == 0:
-            continue
-        if len(_text) == 0:
-            _text = [[part] for part in content]
-            _lang = [[lang] for part in content]
-        else:
-            _text[-1].append(content[0])
-            _lang[-1].append(lang)
-            if len(content) > 1:
-                _text += [[part] for part in content[1:]]
-                _lang += [[lang] for part in content[1:]]
-    return _text, _lang, _speaker
-
-
-def process_auto(text):
-    _text, _lang = [], []
-    for slice in text.split("|"):
-        if slice == "":
-            continue
-        temp_text, temp_lang = [], []
-        sentences_list = split_by_language(slice, target_languages=["zh", "ja", "en"])
-        for sentence, lang in sentences_list:
-            if sentence == "":
-                continue
-            temp_text.append(sentence)
-            if lang == "ja":
-                lang = "jp"
-            temp_lang.append(lang.upper())
-        _text.append(temp_text)
-        _lang.append(temp_lang)
-    return _text, _lang
-
-
-def process_text(
-    text: str,
-    speaker,
-    sdp_ratio,
-    noise_scale,
-    noise_scale_w,
-    length_scale,
-    language,
-    reference_audio,
-    emotion,
-    style_text=None,
-    style_weight=0,
-):
-    audio_list = []
-    if language == "mix":
-        bool_valid, str_valid = re_matching.validate_text(text)
-        if not bool_valid:
-            return str_valid, (
-                hps.data.sampling_rate,
-                np.concatenate([np.zeros(hps.data.sampling_rate // 2)]),
-            )
-        for slice in re_matching.text_matching(text):
-            _text, _lang, _speaker = process_mix(slice)
-            if _speaker is None:
-                continue
-            print(f"Text: {_text}\nLang: {_lang}")
-            audio_list.extend(
-                generate_audio_multilang(
-                    _text,
-                    sdp_ratio,
-                    noise_scale,
-                    noise_scale_w,
-                    length_scale,
-                    _speaker,
-                    _lang,
-                    reference_audio,
-                    emotion,
-                )
-            )
-    elif language.lower() == "auto":
-        _text, _lang = process_auto(text)
-        print(f"Text: {_text}\nLang: {_lang}")
-        audio_list.extend(
-            generate_audio_multilang(
-                _text,
-                sdp_ratio,
-                noise_scale,
-                noise_scale_w,
-                length_scale,
-                speaker,
-                _lang,
-                reference_audio,
-                emotion,
-            )
-        )
-    else:
-        audio_list.extend(
-            generate_audio(
-                text.split("|"),
-                sdp_ratio,
-                noise_scale,
-                noise_scale_w,
-                length_scale,
-                speaker,
-                language,
-                reference_audio,
-                emotion,
-                style_text,
-                style_weight,
-            )
-        )
-    return audio_list
-
+Tip (Optional): check the `Data/{model name}/esd.list` for any transcription errors. The more accurate the transcription, the better the training result.
+"""
 
 def tts_fn(
-    text: str,
-    speaker,
+    text,
+    language,
+    reference_audio_path,
     sdp_ratio,
     noise_scale,
     noise_scale_w,
     length_scale,
-    language,
-    reference_audio,
-    emotion,
-    prompt_mode,
-    style_text=None,
-    style_weight=0,
+    line_split,
+    split_interval,
+    assist_text,
+    assist_text_weight,
+    use_assist_text,
+    style,
+    style_weight,
+    kata_tone_json_str,
+    use_tone,
+    speaker,
 ):
-    if style_text == "":
-        style_text = None
-    if prompt_mode == "Audio prompt":
-        if reference_audio == None:
-            return ("Invalid audio prompt", None)
-        else:
-            reference_audio = load_audio(reference_audio)[1]
-    else:
-        reference_audio = None
+    assert model_holder.current_model is not None
 
-    audio_list = process_text(
-        text,
-        speaker,
-        sdp_ratio,
-        noise_scale,
-        noise_scale_w,
-        length_scale,
-        language,
-        reference_audio,
-        emotion,
-        style_text,
-        style_weight,
-    )
+    wrong_tone_message = ""
+    kata_tone: Optional[list[tuple[str, int]]] = None
+    if use_tone and kata_tone_json_str != "":
+        if language != "JP":
+            logger.warning("Only Japanese is supported for tone generation.")
+            wrong_tone_message = "アクセント指定は現在日本語のみ対応しています。"
+        if line_split:
+            logger.warning("Tone generation is not supported for line split.")
+            wrong_tone_message = "アクセント指定は改行で分けて生成を使わない場合のみ対応しています。"
+        try:
+            kata_tone = []
+            json_data = json.loads(kata_tone_json_str)
+            # tupleを使うように変換
+            for kana, tone in json_data:
+                assert isinstance(kana, str) and tone in (0, 1), f"{kana}, {tone}"
+                kata_tone.append((kana, tone))
+        except Exception as e:
+            logger.warning(f"Error occurred when parsing kana_tone_json: {e}")
+            wrong_tone_message = f"アクセント指定が不正です: {e}"
+            kata_tone = None
 
-    audio_concat = np.concatenate(audio_list)
-    return "Success", (hps.data.sampling_rate, audio_concat)
+    # toneは実際に音声合成に代入される際のみnot Noneになる
+    tone: Optional[list[int]] = None
+    if kata_tone is not None:
+        phone_tone = kata_tone2phone_tone(kata_tone)
+        tone = [t for _, t in phone_tone]
+
+    speaker_id = model_holder.current_model.spk2id[speaker]
+
+    start_time = datetime.datetime.now()
+
+    try:
+        sr, audio = model_holder.current_model.infer(
+            text=text,
+            language=language,
+            reference_audio_path=reference_audio_path,
+            sdp_ratio=sdp_ratio,
+            noise=noise_scale,
+            noisew=noise_scale_w,
+            length=length_scale,
+            line_split=line_split,
+            split_interval=split_interval,
+            assist_text=assist_text,
+            assist_text_weight=assist_text_weight,
+            use_assist_text=use_assist_text,
+            style=style,
+            style_weight=style_weight,
+            given_tone=tone,
+            sid=speaker_id,
+        )
+    except InvalidToneError as e:
+        logger.error(f"Tone error: {e}")
+        return f"Error: アクセント指定が不正です:\n{e}", None, kata_tone_json_str
+
+    end_time = datetime.datetime.now()
+    duration = (end_time - start_time).total_seconds()
+
+    if tone is None and language == "JP":
+        # アクセント指定に使えるようにアクセント情報を返す
+        norm_text = text_normalize(text)
+        kata_tone = g2kata_tone(norm_text)
+        kata_tone_json_str = json.dumps(kata_tone, ensure_ascii=False)
+    elif tone is None:
+        kata_tone_json_str = ""
+    message = f"Success, time: {duration} seconds."
+    if wrong_tone_message != "":
+        message = wrong_tone_message + "\n" + message
+    return message, (sr, audio), kata_tone_json_str
 
 
-def format_utils(text, speaker):
-    _text, _lang = process_auto(text)
-    res = f"[{speaker}]"
-    for lang_s, content_s in zip(_lang, _text):
-        for lang, content in zip(lang_s, content_s):
-            res += f"<{lang.lower()}>{content}"
-        res += "|"
-    return "mix", res[:-1]
+
+initial_md = """
 
 
-def load_audio(path):
-    audio, sr = librosa.load(path, 48000)
-    # audio = librosa.resample(audio, 44100, 48000)
-    return sr, audio
+"""
 
+dataset_md = """
+## Before doing this step please prepare your target speaker audio.
+## Speach only, no background music, no noise, no other people talking, no effects, no music, no nothing, just the voice of the speaker.
 
-def gr_util(item):
-    if item == "Text prompt":
-        return {"visible": True, "__type__": "update"}, {
-            "visible": False,
-            "__type__": "update",
-        }
-    else:
-        return {"visible": False, "__type__": "update"}, {
-            "visible": True,
-            "__type__": "update",
-        }
+## 5 to 10 minutes of audio is enough, but you can use more if you want.
+"""
 
+train_md = """
+## Training 4 batch size requires at least 8GB of GPU memory, Not tested on < 8GB GPUs.
+## Training a 5 minutes dataset takes ~8 minutes for 100 epochs and 4 batch size tested on RTX 3080.
+"""
+# Get path settings
+with open(os.path.join("configs", "paths.yml"), "r", encoding="utf-8") as f:
+    path_config: dict[str, str] = yaml.safe_load(f.read())
+    # dataset_root = path_config["dataset_root"]
+    assets_root = path_config["assets_root"]
 
-if __name__ == "__main__":
-    if config.webui_config.debug:
-        logger.info("Enable DEBUG-LEVEL log")
-        logging.basicConfig(level=logging.DEBUG)
-    hps = utils.get_hparams_from_file(config.webui_config.config_path)
-    # 若config.json中未指定版本则默认为最新版本
-    version = hps.version if hasattr(hps, "version") else latest_version
-    net_g = get_net_g(
-        model_path=config.webui_config.model, version=version, device=device, hps=hps
-    )
-    speaker_ids = hps.data.spk2id
-    speakers = list(speaker_ids.keys())
-    languages = ["ZH", "JP", "EN", "mix", "auto"]
-    with gr.Blocks() as app:
-        with gr.Row():
-            with gr.Column():
-                text = gr.TextArea(
-                    label="输入文本内容",
-                    placeholder="""
-                    如果你选择语言为\'mix\'，必须按照格式输入，否则报错:
-                        格式举例(zh是中文，jp是日语，不区分大小写；说话人举例:gongzi):
-                         [说话人1]<zh>你好，こんにちは！ <jp>こんにちは，世界。
-                         [说话人2]<zh>你好吗？<jp>元気ですか？
-                         [说话人3]<zh>谢谢。<jp>どういたしまして。
-                         ...
-                    另外，所有的语言选项都可以用'|'分割长段实现分句生成。
-                    """,
-                )
-                trans = gr.Button("中翻日", variant="primary")
-                slicer = gr.Button("快速切分", variant="primary")
-                formatter = gr.Button("检测语言，并整理为 MIX 格式", variant="primary")
-                speaker = gr.Dropdown(
-                    choices=speakers, value=speakers[0], label="Speaker"
-                )
-                _ = gr.Markdown(
-                    value="提示模式（Prompt mode）：可选文字提示或音频提示，用于生成文字或音频指定风格的声音。\n",
-                    visible=False,
-                )
-                prompt_mode = gr.Radio(
-                    ["Text prompt", "Audio prompt"],
-                    label="Prompt Mode",
-                    value="Text prompt",
-                    visible=False,
-                )
-                text_prompt = gr.Textbox(
-                    label="Text prompt",
-                    placeholder="用文字描述生成风格。如：Happy",
-                    value="Happy",
-                    visible=False,
-                )
-                audio_prompt = gr.Audio(
-                    label="Audio prompt", type="filepath", visible=False
-                )
-                sdp_ratio = gr.Slider(
-                    minimum=0, maximum=1, value=0.5, step=0.1, label="SDP Ratio"
-                )
-                noise_scale = gr.Slider(
-                    minimum=0.1, maximum=2, value=0.6, step=0.1, label="Noise"
-                )
-                noise_scale_w = gr.Slider(
-                    minimum=0.1, maximum=2, value=0.9, step=0.1, label="Noise_W"
-                )
-                length_scale = gr.Slider(
-                    minimum=0.1, maximum=2, value=1.0, step=0.1, label="Length"
-                )
-                language = gr.Dropdown(
-                    choices=languages, value=languages[0], label="Language"
-                )
-                btn = gr.Button("生成音频！", variant="primary")
-            with gr.Column():
-                with gr.Accordion("融合文本语义", open=False):
-                    gr.Markdown(
-                        value="使用辅助文本的语意来辅助生成对话（语言保持与主文本相同）\n\n"
-                        "**注意**：不要使用**指令式文本**（如：开心），要使用**带有强烈情感的文本**（如：我好快乐！！！）\n\n"
-                        "效果较不明确，留空即为不使用该功能"
+languages = [l.value for l in Languages]
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--cpu", action="store_true", help="Use CPU instead of GPU")
+parser.add_argument(
+    "--dir", "-d", type=str, help="Model directory", default=assets_root
+)
+parser.add_argument(
+    "--share", action="store_true", help="Share this app publicly", default=False
+)
+parser.add_argument(
+    "--server-name",
+    type=str,
+    default=None,
+    help="Server name for Gradio app",
+)
+parser.add_argument(
+    "--no-autolaunch",
+    action="store_true",
+    default=False,
+    help="Do not launch app automatically",
+)
+args = parser.parse_args()
+model_dir = args.dir
+
+if args.cpu:
+    device = "cpu"
+else:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model_holder = ModelHolder(model_dir, device)
+
+model_names = model_holder.model_names
+if len(model_names) == 0:
+    logger.error(f"モデルが見つかりませんでした。{model_dir}にモデルを置いてください。")
+    sys.exit(1)
+initial_id = 0
+initial_pth_files = model_holder.model_files_dict[model_names[initial_id]]
+with gr.Blocks(theme="NoCrypt/miku") as app:
+    gr.Markdown(initial_md)
+    with gr.Tabs():
+        with gr.TabItem("Inference"):
+             with gr.Row():
+                with gr.Column():
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            model_name = gr.Dropdown(
+                                label="Model List",
+                                choices=model_names,
+                                value=model_names[initial_id],
+                            )
+                            model_path = gr.Dropdown(
+                                label="Model File",
+                                choices=initial_pth_files,
+                                value=initial_pth_files[0],
+                            )
+                        refresh_button = gr.Button("Refresh", scale=1, visible=True)
+                        load_button = gr.Button("Load", scale=1, variant="primary")
+                    text_input = gr.TextArea(label="Text", value="Hello world!")
+                    
+                    line_split = gr.Checkbox(label="Split by newline", value=DEFAULT_LINE_SPLIT)
+                    split_interval = gr.Slider(
+                        minimum=0.0,
+                        maximum=2,
+                        value=DEFAULT_SPLIT_INTERVAL,
+                        step=0.1,
+                        label="Silence duration to insert between new lines (in seconds)",
                     )
-                    style_text = gr.Textbox(label="辅助文本")
+                    line_split.change(
+                        lambda x: (gr.Slider(visible=x)),
+                        inputs=[line_split],
+                        outputs=[split_interval],
+                    )
+                    tone = gr.Textbox(
+                        label="Tone adjustment (only numbers 0=low or 1=high are valid)",
+                        info="Can only be used when not splitting by newline. It's not perfect.",
+                    )
+                    use_tone = gr.Checkbox(label="Use tone adjustment", value=False)
+                    use_tone.change(
+                        lambda x: (gr.Checkbox(value=False) if x else gr.Checkbox()),
+                        inputs=[use_tone],
+                        outputs=[line_split],
+                    )
+                    language = gr.Dropdown(choices=languages, value="EN", label="Language")
+                    speaker = gr.Dropdown(label="Speaker")
+                    with gr.Accordion(label="Detailed Settings", open=False):
+                        sdp_ratio = gr.Slider(
+                            minimum=0,
+                            maximum=1,
+                            value=DEFAULT_SDP_RATIO,
+                            step=0.1,
+                            label="SDP Ratio",
+                        )
+                        noise_scale = gr.Slider(
+                            minimum=0.1,
+                            maximum=2,
+                            value=DEFAULT_NOISE,
+                            step=0.1,
+                            label="Noise",
+                        )
+                        noise_scale_w = gr.Slider(
+                            minimum=0.1,
+                            maximum=2,
+                            value=DEFAULT_NOISEW,
+                            step=0.1,
+                            label="Noise_W",
+                        )
+                        length_scale = gr.Slider(
+                            minimum=0.1,
+                            maximum=2,
+                            value=DEFAULT_LENGTH,
+                            step=0.1,
+                            label="Length",
+                        )
+                        use_assist_text = gr.Checkbox(label="Use assist text", value=False)
+                        assist_text = gr.Textbox(
+                            label="Assist text",
+                            placeholder="どうして私の意見を無視するの？許せない、ムカつく！死ねばいいのに。",
+                            info="This text will make the voice sound more like a reading of this text, but the tone and tempo may suffer.",
+                            visible=False,
+                        )
+                        assist_text_weight = gr.Slider(
+                            minimum=0,
+                            maximum=1,
+                            value=DEFAULT_ASSIST_TEXT_WEIGHT,
+                            step=0.1,
+                            label="Weight of assist text",
+                            visible=False,
+                        )
+                        use_assist_text.change(
+                            lambda x: (gr.Textbox(visible=x), gr.Slider(visible=x)),
+                            inputs=[use_assist_text],
+                            outputs=[assist_text, assist_text_weight],
+                        )
+                with gr.Column():
+                    with gr.Accordion("About Styles", open=False):
+                        gr.Markdown("About Styles.............")
+                    style_mode = gr.Radio(
+                        ["Choose from previews", "Enter audio file"],
+                        label="How to specify style",
+                        value="Choose from previews",
+                    )
+                    style = gr.Dropdown(
+                        label=f"Style ({DEFAULT_STYLE} is average style)",
+                        choices=["Load model first"],
+                        value="Load model first",
+                    )
                     style_weight = gr.Slider(
                         minimum=0,
-                        maximum=1,
-                        value=0.7,
+                        maximum=50,
+                        value=DEFAULT_STYLE_WEIGHT,
                         step=0.1,
-                        label="Weight",
-                        info="主文本和辅助文本的bert混合比率，0表示仅主文本，1表示仅辅助文本",
+                        label="Weight of style",
                     )
-                with gr.Row():
-                    with gr.Column():
-                        interval_between_sent = gr.Slider(
-                            minimum=0,
-                            maximum=5,
-                            value=0.2,
-                            step=0.1,
-                            label="句间停顿(秒)，勾选按句切分才生效",
+                    ref_audio_path = gr.Audio(label="Reference audio", type="filepath", visible=False)
+                    tts_button = gr.Button(
+                        "Text to Speech (Load model first)", variant="primary", interactive=False
+                    )
+                    text_output = gr.Textbox(label="Info")
+                    audio_output = gr.Audio(label="Result")
+                   # with gr.Accordion("Text Examples", open=False):
+                       # gr.Examples(examples, inputs=[text_input, language])
+
+                tts_button.click(
+                    tts_fn,
+                    inputs=[
+                        text_input,
+                        language,
+                        ref_audio_path,
+                        sdp_ratio,
+                        noise_scale,
+                        noise_scale_w,
+                        length_scale,
+                        line_split,
+                        split_interval,
+                        assist_text,
+                        assist_text_weight,
+                        use_assist_text,
+                        style,
+                        style_weight,
+                        tone,
+                        use_tone,
+                        speaker,
+                    ],
+                    outputs=[text_output, audio_output, tone],
+                )
+
+                model_name.change(
+                    model_holder.update_model_files_gr,
+                    inputs=[model_name],
+                    outputs=[model_path],
+                )
+
+                model_path.change(make_non_interactive, outputs=[tts_button])
+
+                refresh_button.click(
+                    model_holder.update_model_names_gr,
+                    outputs=[model_name, model_path, tts_button],
+                )
+
+                load_button.click(
+                    model_holder.load_model_gr,
+                    inputs=[model_name, model_path],
+                    outputs=[style, tts_button, speaker],
+                )
+
+                style_mode.change(
+                    gr_util,
+                    inputs=[style_mode],
+                    outputs=[style, ref_audio_path],
+                )
+
+        with gr.TabItem("Voice Training"):
+            with gr.Tabs():
+                with gr.TabItem("Step 1: Dataset Processing"):
+                    gr.Markdown(dataset_md)
+                    model_name = gr.Textbox(label="Enter model name (will also be used as speaker name).")
+                    gr.Markdown("## Audio slicing")
+                    with gr.Accordion("Audio slicing"):
+                        with gr.Row():
+                            with gr.Column():
+                                input_dir = gr.Textbox(
+                                    label="Audio files folder",
+                                    placeholder="inputs",
+                                    info="Please put wav files in the input folder. or type the path to a folder containing your wav files.",
+                                )
+                                gr.Markdown("### Slicing settings")
+                                min_sec = gr.Slider(
+                                    minimum=0, maximum=10, value=2, step=0.5, label="Discard audio slices shorter than this duration (in seconds)"
+                                )
+                                max_sec = gr.Slider(
+                                    minimum=0, maximum=15, value=12, step=0.5, label="Discard audio slices longer than this duration (in seconds)"
+                                )
+                                min_silence_dur_ms = gr.Slider(
+                                    minimum=0,
+                                    maximum=2000,
+                                    value=700,
+                                    step=100,
+                                    label="Minimum duration of silence to consider as separator (in ms)",
+                                )
+                                slice_button = gr.Button("Slice audio", variant="primary")
+                            result1 = gr.Textbox(label="Result")
+                    gr.Markdown("## Dataset Transcription (IMPORTANT)")  
+                    with gr.Accordion("Transcription"): 
+                        with gr.Row():
+                    
+                            with gr.Column():
+                                raw_dir = gr.Textbox(
+                                    label="Folder containing the raw and sliced dataset `Default (Data/{model name}/raw)`",
+                                    placeholder="Leave blank if you sclied the dataset in the previous step",
+                                )
+                                whisper_model = gr.Dropdown(
+                                    ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"],
+                                    label="Whisper model",
+                                    value="large-v3",
+                                )
+                                compute_type = gr.Dropdown(
+                                    [
+                                        "int8",
+                                        "int8_float32",
+                                        "int8_float16",
+                                        "int8_bfloat16",
+                                        "int16",
+                                        "float16",
+                                        "bfloat16",
+                                        "float32",
+                                    ],
+                                    label="Computation precision",
+                                    value="bfloat16",
+                                )
+                                device = gr.Radio(["cuda", "cpu"], label="Device", value="cuda")
+                                language = gr.Dropdown(["ja", "en", "zh"], value="en", label="Language")
+                                """ initial_prompt = gr.Textbox(
+                                        label="Initial prompt",
+                                        placeholder="こんにちは。元気、ですかー？ふふっ、私は…ちゃんと元気だよ！",
+                                        info="For example, the sentence you want to be written like this, if it's in Japanese, you can omit it, if it's in English or Chinese, please write it",
+                                    )"""
+                            transcribe_button = gr.Button("Transcribe audio", variant="primary")
+                            result2 = gr.Textbox(label="Result")
+                            
+                            slice_button.click(
+                                do_slice,
+                                inputs=[model_name, min_sec, max_sec, min_silence_dur_ms, input_dir],
+                                outputs=[result1],
+                            )
+                            transcribe_button.click(
+                                do_transcribe,
+                                inputs=[
+                                    model_name,
+                                    whisper_model,
+                                    compute_type,
+                                    language,
+                                    #initial_prompt,
+                                    raw_dir,
+                                    device,
+                                ],
+                                outputs=[result2],
+                            )
+                with gr.TabItem("Step 2: Training"):
+                    gr.Markdown(train_md)
+                    model_name = gr.Textbox(
+                        label="Model name",
+                        placeholder="Type the same model name you entered in step 1",
+                    )
+                    gr.Markdown("### Automatic preprocessing")
+                    with gr.Row(variant="panel"):
+                        with gr.Column():
+                            batch_size = gr.Slider(
+                                label="Batch size",
+                                value=4,
+                                minimum=1,
+                                maximum=64,
+                                step=1,
+                            )
+                            epochs = gr.Slider(
+                                label="Number of epochs",
+                                info="100 should be enough, but you can run more and the quality might improve",
+                                value=100,
+                                minimum=10,
+                                maximum=1000,
+                                step=10,
+                            )
+                            save_every_steps = gr.Slider(
+                                label="How often to save the results (in steps)",
+                                info="Different from the number of epochs",
+                                value=1000,
+                                minimum=100,
+                                maximum=10000,
+                                step=100,
+                            )
+                            bf16_run = gr.Checkbox(
+                                label="Use bf16",
+                                info="Might make training faster on new GPUs, but might not work on old GPUs",
+                                value=True,
+                            )
+                            num_processes = gr.Slider(
+                                label="Number of processes",
+                                info="Number of parallel processes for preprocessing, can cause freezing if too large",
+                                value=cpu_count() // 2,
+                                minimum=1,
+                                maximum=cpu_count(),
+                                step=1,
+                            )
+                            normalize = gr.Checkbox(
+                                label="Normalize audio volume (if volume is not consistent)",
+                                value=False,
+                            )
+                            trim = gr.Checkbox(
+                                label="Trim silence at the beginning and end of audio",
+                                value=False,
+                            )
+                        with gr.Column():
+                            preprocess_button = gr.Button(value="Run automatic preprocessing", variant="primary")
+                            info_all = gr.Textbox(label="Status")
+                    with gr.Accordion(open=False, label="Manual preprocessing (optional)"):
+                        with gr.Row(variant="panel"):
+                            with gr.Column():
+                                gr.Markdown(value="#### Step 1: Generate configuration file")
+                                batch_size_manual = gr.Slider(
+                                    label="Batch size",
+                                    value=4,
+                                    minimum=1,
+                                    maximum=64,
+                                    step=1,
+                                )
+                                epochs_manual = gr.Slider(
+                                    label="Number of epochs",
+                                    value=100,
+                                    minimum=1,
+                                    maximum=1000,
+                                    step=1,
+                                )
+                                save_every_steps_manual = gr.Slider(
+                                    label="How often to save the results (in steps)",
+                                    value=1000,
+                                    minimum=100,
+                                    maximum=10000,
+                                    step=100,
+                                )
+                                bf16_run_manual = gr.Checkbox(
+                                    label="Use bf16",
+                                    value=True,
+                                )
+                            with gr.Column():
+                                generate_config_btn = gr.Button(value="Run", variant="primary")
+                                info_init = gr.Textbox(label="Status")
+                        with gr.Row(variant="panel"):
+                            with gr.Column():
+                                gr.Markdown(value="#### Step 2: Resample audio files")
+                                num_processes_resample = gr.Slider(
+                                    label="Number of processes",
+                                    value=cpu_count() // 2,
+                                    minimum=1,
+                                    maximum=cpu_count(),
+                                    step=1,
+                                )
+                                normalize_resample = gr.Checkbox(
+                                    label="Normalize audio volume",
+                                    value=False,
+                                )
+                                trim_resample = gr.Checkbox(
+                                    label="Trim silence at the beginning and end of audio",
+                                    value=False,
+                                )
+                            with gr.Column():
+                                resample_btn = gr.Button(value="Run", variant="primary")
+                                info_resample = gr.Textbox(label="Status")
+                        with gr.Row(variant="panel"):
+                            with gr.Column():
+                                gr.Markdown(value="#### Step 3: Preprocess transcript files")
+                            with gr.Column():
+                                preprocess_text_btn = gr.Button(value="Run", variant="primary")
+                                info_preprocess_text = gr.Textbox(label="Status")
+                        with gr.Row(variant="panel"):
+                            with gr.Column():
+                                gr.Markdown(value="#### Step 4: Generate BERT feature files")
+                            with gr.Column():
+                                bert_gen_btn = gr.Button(value="Run", variant="primary")
+                                info_bert = gr.Textbox(label="Status")
+                        with gr.Row(variant="panel"):
+                            with gr.Column():
+                                gr.Markdown(value="#### Step 5: Generate style feature files")
+                                num_processes_style = gr.Slider(
+                                    label="Number of processes",
+                                    value=cpu_count() // 2,
+                                    minimum=1,
+                                    maximum=cpu_count(),
+                                    step=1,
+                                )
+                            with gr.Column():
+                                style_gen_btn = gr.Button(value="Run", variant="primary")
+                                info_style = gr.Textbox(label="Status")
+                    gr.Markdown("## Training")
+                    with gr.Row(variant="panel"):
+                        train_btn = gr.Button(value="Start training", variant="primary")
+                        info_train = gr.Textbox(label="Status")
+                        preprocess_button.click(
+                            second_elem_of(preprocess_all),
+                            inputs=[
+                                model_name,
+                                batch_size,
+                                epochs,
+                                save_every_steps,
+                                bf16_run,
+                                num_processes,
+                                normalize,
+                                trim,
+                            ],
+                            outputs=[info_all],
                         )
-                        interval_between_para = gr.Slider(
-                            minimum=0,
-                            maximum=10,
-                            value=1,
-                            step=0.1,
-                            label="段间停顿(秒)，需要大于句间停顿才有效",
+                        generate_config_btn.click(
+                            second_elem_of(initialize),
+                            inputs=[
+                                model_name,
+                                batch_size_manual,
+                                epochs_manual,
+                                save_every_steps_manual,
+                                bf16_run_manual,
+                            ],
+                            outputs=[info_init],
                         )
-                        opt_cut_by_sent = gr.Checkbox(
-                            label="按句切分    在按段落切分的基础上再按句子切分文本"
+                        resample_btn.click(
+                            second_elem_of(resample),
+                            inputs=[
+                                model_name,
+                                normalize_resample,
+                                trim_resample,
+                                num_processes_resample,
+                            ],
+                            outputs=[info_resample],
                         )
-                        slicer = gr.Button("切分生成", variant="primary")
-                text_output = gr.Textbox(label="状态信息")
-                audio_output = gr.Audio(label="输出音频")
-                # explain_image = gr.Image(
-                #     label="参数解释信息",
-                #     show_label=True,
-                #     show_share_button=False,
-                #     show_download_button=False,
-                #     value=os.path.abspath("./img/参数说明.png"),
-                # )
-        btn.click(
-            tts_fn,
-            inputs=[
-                text,
-                speaker,
-                sdp_ratio,
-                noise_scale,
-                noise_scale_w,
-                length_scale,
-                language,
-                audio_prompt,
-                text_prompt,
-                prompt_mode,
-                style_text,
-                style_weight,
-            ],
-            outputs=[text_output, audio_output],
-        )
+                        preprocess_text_btn.click(
+                            second_elem_of(preprocess_text),
+                            inputs=[model_name],
+                            outputs=[info_preprocess_text],
+                        )
+                        bert_gen_btn.click(
+                            second_elem_of(bert_gen),
+                            inputs=[model_name],
+                            outputs=[info_bert],
+                        )
+                        style_gen_btn.click(
+                            second_elem_of(style_gen),
+                            inputs=[model_name, num_processes_style],
+                            outputs=[info_style],
+                        )
+                        train_btn.click(
+                            second_elem_of(train), inputs=[model_name], outputs=[info_train]
+                        )
 
-        trans.click(
-            translate,
-            inputs=[text],
-            outputs=[text],
-        )
-        slicer.click(
-            tts_split,
-            inputs=[
-                text,
-                speaker,
-                sdp_ratio,
-                noise_scale,
-                noise_scale_w,
-                length_scale,
-                language,
-                opt_cut_by_sent,
-                interval_between_para,
-                interval_between_sent,
-                audio_prompt,
-                text_prompt,
-                style_text,
-                style_weight,
-            ],
-            outputs=[text_output, audio_output],
-        )
+                with gr.TabItem("Step 3: Generate Styles (Optional/Experimental)"):
+                    with gr.Row():
+                        model_name = gr.Textbox(placeholder="your_model_name", label="Model name")
+                        reduction_method = gr.Radio(
+                            choices=["UMAP", "t-SNE"],
+                            label="Reduction method",
+                            info="v 1.3 used t-SNE, but UMAP might have better possibilities.",
+                            value="Umap",
+                        )
+                        load_button = gr.Button("Load style vectors", variant="primary")
+                    output = gr.Plot(label="Visualization of audio styles")
+                    load_button.click(load, inputs=[model_name, reduction_method], outputs=[output])
+                    with gr.Tab("Method 1: Automatic style separation"):
+                        with gr.Tab("Style separation 1"):
+                            n_clusters = gr.Slider(
+                                minimum=2,
+                                maximum=10,
+                                step=1,
+                                value=4,
+                                label="Number of styles to create (excluding average style)",
+                                info="Please try different numbers of styles while looking at the above plot.",
+                            )
+                            c_method = gr.Radio(
+                                choices=["Agglomerative after reduction", "KMeans after reduction", "Agglomerative", "KMeans"],
+                                label="Algorithm",
+                                info="You can try different clustering algorithms.",
+                                value="Agglomerative after reduction",
+                            )
+                            c_button = gr.Button("Run clustering")
+                        with gr.Tab("Style separation 2: DBSCAN"):
+                            gr.Markdown("dbscan_md")
+                            eps = gr.Slider(
+                                minimum=0.1,
+                                maximum=10,
+                                step=0.01,
+                                value=0.3,
+                                label="eps",
+                            )
+                            min_samples = gr.Slider(
+                                minimum=1,
+                                maximum=50,
+                                step=1,
+                                value=15,
+                                label="min_samples",
+                            )
+                            with gr.Row():
+                                dbscan_button = gr.Button("Run clustering")
+                                num_styles_result = gr.Textbox(label="Number of styles")
+                        gr.Markdown("Clustering results")
+                        gr.Markdown("Note: Since we are reducing it from 256 dimensions to 2 dimensions, the exact position relationship of the vectors cannot be guaranteed.")
+                        with gr.Row():
+                            gr_plot = gr.Plot()
+                            with gr.Column():
+                                with gr.Row():
+                                    cluster_index = gr.Slider(
+                                        minimum=1,
+                                        maximum=10,
+                                        step=1,
+                                        value=1,
+                                        label="Style number",
+                                        info="The representative audio file of the selected style will be displayed.",
+                                    )
+                                    num_files = gr.Slider(
+                                        minimum=1,
+                                        maximum=10,
+                                        step=1,
+                                        value=5,
+                                        label="Number of representative audio files to display",
+                                    )
+                                    get_audios_button = gr.Button("Get representative audio files")
+                                with gr.Row():
+                                    audio_list = []
+                                    for i in range(10):
+                                        audio_list.append(gr.Audio(visible=False, show_label=True))
+                            c_button.click(
+                                do_clustering_gradio,
+                                inputs=[n_clusters, c_method],
+                                outputs=[gr_plot, cluster_index] + audio_list,
+                            )
+                            dbscan_button.click(
+                                do_dbscan_gradio,
+                                inputs=[eps, min_samples],
+                                outputs=[gr_plot, cluster_index, num_styles_result] + audio_list,
+                            )
+                            get_audios_button.click(
+                                representative_wav_files_gradio,
+                                inputs=[cluster_index, num_files],
+                                outputs=audio_list,
+                            )
+                        gr.Markdown("If the results look good, let's save them.")
+                        style_names = gr.Textbox(
+                            "Angry, Sad, Happy",
+                            label="Style names",
+                            info="Please enter the names of the styles, separated by comma (you can use Japanese). Example: `Angry, Sad, Happy` or `怒り, 悲しみ, 喜び` etc. The average style will be automatically saved as `{DEFAULT_STYLE}`.",
+                        )
+                        with gr.Row():
+                            save_button1 = gr.Button("Save style vectors", variant="primary")
+                            info2 = gr.Textbox(label="Saving result")
 
-        prompt_mode.change(
-            lambda x: gr_util(x),
-            inputs=[prompt_mode],
-            outputs=[text_prompt, audio_prompt],
-        )
+                        save_button1.click(
+                            save_style_vectors_from_clustering,
+                            inputs=[model_name, style_names],
+                            outputs=[info2],
+                        )
+                    with gr.Tab("Method 2: Manually select styles"):
+                        gr.Markdown("Please enter the filenames of the representative audio files for each style, separated by comma, and the corresponding style names, also separated by comma, in the text box below.")
+                        gr.Markdown("Example: `angry.wav, sad.wav, happy.wav` and `Angry, Sad, Happy`")
+                        gr.Markdown(f"Note: The `{DEFAULT_STYLE}` style will be automatically saved, so please do not define a style with the name `{DEFAULT_STYLE}`.")
+                        with gr.Row():
+                            audio_files_text = gr.Textbox(
+                                label="Audio file names", placeholder="angry.wav, sad.wav, happy.wav"
+                            )
+                            style_names_text = gr.Textbox(
+                                label="Style names", placeholder="Angry, Sad, Happy"
+                            )
+                        with gr.Row():
+                            save_button2 = gr.Button("Save style vectors", variant="primary")
+                            info2 = gr.Textbox(label="Saving result")
+                            save_button2.click(
+                                save_style_vectors_from_files,
+                                inputs=[model_name, audio_files_text, style_names_text],
+                                outputs=[info2],
+                            )
 
-        audio_prompt.upload(
-            lambda x: load_audio(x),
-            inputs=[audio_prompt],
-            outputs=[audio_prompt],
-        )
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--server-name",
+    type=str,
+    default=None,
+    help="Server name for Gradio app",
+)
+parser.add_argument(
+    "--no-autolaunch",
+    action="store_true",
+    default=False,
+    help="Do not launch app automatically",
+)
+args = parser.parse_args()
 
-        formatter.click(
-            format_utils,
-            inputs=[text, speaker],
-            outputs=[language, text],
-        )
-
-    print("推理页面已开启!")
-    webbrowser.open(f"http://127.0.0.1:{config.webui_config.port}")
-    app.launch(share=config.webui_config.share, server_port=config.webui_config.port)
+app.launch(inbrowser=not args.no_autolaunch, server_name=args.server_name)

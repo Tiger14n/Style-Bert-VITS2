@@ -53,6 +53,7 @@ def tts_fn(
     kata_tone_json_str,
     use_tone,
     speaker,
+    model_holder
 ):
     assert model_holder.current_model is not None
 
@@ -447,6 +448,3 @@ if __name__ == "__main__":
             outputs=[style, ref_audio_path],
         )
 
-    app.launch(
-        inbrowser=not args.no_autolaunch, share=args.share, server_name=args.server_name
-    )
